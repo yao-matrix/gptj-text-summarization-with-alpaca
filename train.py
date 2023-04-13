@@ -12,6 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import os
 import copy
 import logging
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from torch.utils.data import Dataset
 from transformers import Trainer
 
 import utils
+import pickle
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -42,6 +44,8 @@ PROMPT_DICT = {
     ),
 }
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+os.environ["WANDB_DISABLED"] = "True"
 
 @dataclass
 class ModelArguments:
@@ -58,9 +62,11 @@ class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     model_max_length: int = field(
-        default=512,
+        default=2048,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
+    dataloader_drop_last: bool = field(default=True)
+    bf16: bool = field(default=True)
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -101,7 +107,7 @@ def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedToken
         tokenizer(
             text,
             return_tensors="pt",
-            padding="longest",
+            padding="max_length",
             max_length=tokenizer.model_max_length,
             truncation=True,
         )
@@ -111,6 +117,11 @@ def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedToken
     input_ids_lens = labels_lens = [
         tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
     ]
+    for i in range(len(input_ids_lens)):
+        if input_ids_lens[i] > 2048:
+            print("xxxxx exceed max model length")
+            print(input_ids_lens[i])
+            print(strings[i])
     return dict(
         input_ids=input_ids,
         labels=labels,
@@ -145,13 +156,20 @@ class SupervisedDataset(Dataset):
         logging.warning("Formatting inputs...")
         prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
         sources = [
-            prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
-            for example in list_data_dict
+            prompt_input.format_map(example) for example in list_data_dict
         ]
         targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
 
-        logging.warning("Tokenizing inputs... This may take some time...")
-        data_dict = preprocess(sources, targets, tokenizer)
+        data_dict = None
+        if os.path.isfile("dict.pickle"):
+            with open('dict.pickle', 'rb') as f:
+                logging.warning("Reuse pickled data")
+                data_dict = pickle.load(f)
+        else:
+            logging.warning("Tokenizing inputs... This may take some time...")
+            data_dict = preprocess(sources, targets, tokenizer)
+            with open('dict.pickle', 'wb') as f:
+                pickle.dump(data_dict, f, pickle.HIGHEST_PROTOCOL)
 
         self.input_ids = data_dict["input_ids"]
         self.labels = data_dict["labels"]
@@ -188,16 +206,41 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
+def compute_metrics(eval_preds):
+    preds, labels = eval_preds
+
+    if isinstance(preds, tuple):
+        preds = preds[0]
+    decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+    # Replace -100 in the labels as we can't decode them.
+    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    # Some simple post-processing
+    decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+
+    result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
+    result = {k: round(v * 100, 4) for k, v in result.items()}
+    prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
+    result["gen_len"] = np.mean(prediction_lens)
+    return result
 
 def train():
+    transformers.set_seed(666)
+
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+
+    print(f"initial learning rate: {training_args.learning_rate}")
 
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
     )
 
+    # print(model)
+    config = transformers.GPTJConfig.from_pretrained(model_args.model_name_or_path)
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
@@ -205,13 +248,16 @@ def train():
         padding_side="right",
         use_fast=False,
     )
+    # print(f"max model sequence length: {config.n_positions}")
     if tokenizer.pad_token is None:
         smart_tokenizer_and_embedding_resize(
             special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
             tokenizer=tokenizer,
             model=model,
         )
-    if "llama" in model_args.model_name_or_path:
+    # print (f"eos: {tokenizer.eos_token}, bos: {tokenizer.bos_token}, unknown: {tokenizer.unk_token}")
+    # if "llama" in model_args.model_name_or_path:
+    if False:
         tokenizer.add_special_tokens(
             {
                 "eos_token": DEFAULT_EOS_TOKEN,
@@ -222,7 +268,7 @@ def train():
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
-    trainer.train()
+    trainer.train(resume_from_checkpoint=True)
     trainer.save_state()
     safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
